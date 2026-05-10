@@ -10,10 +10,17 @@ load_dotenv()
 app = FastAPI(title="Miruro API", version="2.0")
 
 # --- Security Configuration ---
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",")
+# Parse allowed origins; treat "*" or empty list as "allow all"
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "")
+if ALLOWED_ORIGINS.strip() == "" or ALLOWED_ORIGINS == "*":
+    ALLOWED_ORIGINS = ["*"]
+else:
+    ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS.split(",") if origin.strip()]
+
 API_KEY_NAME = "x-api-key"
 VALID_API_KEY = os.getenv("API_KEY")
 
+# CORS middleware – respects the same ALLOWED_ORIGINS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -24,25 +31,29 @@ app.add_middleware(
 
 @app.middleware("http")
 async def secure_api(request: Request, call_next):
-    # Allow home page (docs) without restrictions
+    # Allow documentation pages without restrictions
     if request.url.path in ["/", "/docs", "/redoc", "/openapi.json"]:
         return await call_next(request)
 
-    # 1. Check API Key
+    # 1. Check API Key (if provided in env)
     api_key = request.headers.get(API_KEY_NAME)
     if VALID_API_KEY and api_key == VALID_API_KEY:
         return await call_next(request)
 
-    # 2. Check Origin or Referer
+    # 2. Check Origin or Referer (improved wildcard support)
     origin = request.headers.get("origin")
     referer = request.headers.get("referer")
 
     is_allowed = False
     for allowed in ALLOWED_ORIGINS:
+        if allowed == "*":
+            is_allowed = True
+            break
         if (origin and origin.startswith(allowed)) or (referer and referer.startswith(allowed)):
             is_allowed = True
             break
-            
+
+    # If no origin/referer is provided at all, we still require an API key (already failed above)
     if not is_allowed:
         return JSONResponse(
             status_code=403,
