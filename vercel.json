@@ -1,22 +1,38 @@
 {
   "version": 2,
+
+  "builds": [
+    {
+      "src": "api/*.js",
+      "use": "@vercel/node"
+    }
+  ],
+
   "rewrites": [
-    { "source": "/search",                          "destination": "/api/search" },
-    { "source": "/suggestions",                     "destination": "/api/search" },
-    { "source": "/filter",                          "destination": "/api/search" },
-    { "source": "/spotlight",                       "destination": "/api/anime" },
-    { "source": "/trending",                        "destination": "/api/anime" },
-    { "source": "/popular",                         "destination": "/api/anime" },
-    { "source": "/upcoming",                        "destination": "/api/anime" },
-    { "source": "/recent",                          "destination": "/api/anime" },
-    { "source": "/schedule",                        "destination": "/api/anime" },
-    { "source": "/info/:anilist_id",                "destination": "/api/anime" },
-    { "source": "/anime/:id/characters",            "destination": "/api/anime" },
-    { "source": "/anime/:id/relations",             "destination": "/api/anime" },
-    { "source": "/anime/:id/recommendations",       "destination": "/api/anime" },
-    { "source": "/episodes/:anilist_id",            "destination": "/api/parser" },
-    { "source": "/sources",                         "destination": "/api/parser" },
-    { "source": "/watch/:provider/:anilist_id/:category/:slug", "destination": "/api/parser" },
-    { "source": "/",                                "destination": "/api/index" }
+    { "source": "/search", "destination": "/api/search" },
+    { "source": "/suggestions", "destination": "/api/search" },
+    { "source": "/filter", "destination": "/api/search" },
+
+    { "source": "/spotlight", "destination": "/api/anime" },
+    { "source": "/trending", "destination": "/api/anime" },
+    { "source": "/popular", "destination": "/api/anime" },
+    { "source": "/upcoming", "destination": "/api/anime" },
+    { "source": "/recent", "destination": "/api/anime" },
+    { "source": "/schedule", "destination": "/api/anime" },
+
+    { "source": "/info/:anilist_id", "destination": "/api/anime" },
+    { "source": "/anime/:id/characters", "destination": "/api/anime" },
+    { "source": "/anime/:id/relations", "destination": "/api/anime" },
+    { "source": "/anime/:id/recommendations", "destination": "/api/anime" },
+
+    { "source": "/episodes/:anilist_id", "destination": "/api/parser" },
+    { "source": "/sources", "destination": "/api/parser" },
+
+    {
+      "source": "/watch/:provider/:anilist_id/:category/:slug",
+      "destination": "/api/parser"
+    },
+
+    { "source": "/", "destination": "/api/index" }
   ]
 }
