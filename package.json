@@ -1,0 +1,16 @@
+{
+  "name": "miruro-api",
+  "version": "2.0.0",
+  "description": "Miruro Native API — Node.js/Hono port",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "hono": "^4.4.0"
+  },
+  "devDependencies": {
+    "vercel": "^34.0.0"
+  }
+}
