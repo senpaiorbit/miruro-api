@@ -1,15 +1,16 @@
-import base64, json, gzip, httpx, os, re, math
+import base64, json, gzip, httpx, os
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, List, Dict, Any
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Anime API (Multi-Provider)", version="2.0")
+app = FastAPI(title="Miruro API", version="2.0")
 
-# --- Security / CORS configuration (same as original) ---
+# --- Security Configuration ---
+# Parse allowed origins; treat "*" or empty list as "allow all"
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "")
 if ALLOWED_ORIGINS.strip() == "" or ALLOWED_ORIGINS == "*":
     ALLOWED_ORIGINS = ["*"]
@@ -18,8 +19,8 @@ else:
 
 API_KEY_NAME = "x-api-key"
 VALID_API_KEY = os.getenv("API_KEY")
-DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "anikoto")
 
+# CORS middleware – respects the same ALLOWED_ORIGINS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -30,15 +31,19 @@ app.add_middleware(
 
 @app.middleware("http")
 async def secure_api(request: Request, call_next):
+    # Allow documentation pages without restrictions
     if request.url.path in ["/", "/docs", "/redoc", "/openapi.json"]:
         return await call_next(request)
 
+    # 1. Check API Key (if provided in env)
     api_key = request.headers.get(API_KEY_NAME)
     if VALID_API_KEY and api_key == VALID_API_KEY:
         return await call_next(request)
 
+    # 2. Check Origin or Referer (improved wildcard support)
     origin = request.headers.get("origin")
     referer = request.headers.get("referer")
+
     is_allowed = False
     for allowed in ALLOWED_ORIGINS:
         if allowed == "*":
@@ -47,58 +52,57 @@ async def secure_api(request: Request, call_next):
         if (origin and origin.startswith(allowed)) or (referer and referer.startswith(allowed)):
             is_allowed = True
             break
+
+    # If no origin/referer is provided at all, we still require an API key (already failed above)
     if not is_allowed:
-        return JSONResponse(status_code=403, content={"detail": "Access forbidden"})
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Access forbidden: Invalid Origin, Referer, or API Key."}
+        )
+
     return await call_next(request)
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": "https://www.miruro.tv/"}
 ANILIST_URL = "https://graphql.anilist.co"
 MIRURO_PIPE_URL = "https://www.miruro.tv/api/secure/pipe"
 
-# ---------- Utility functions (unchanged from original) ----------
-def _translate_id(encoded_id: str) -> str:
-    try:
-        decoded = base64.urlsafe_b64decode(encoded_id + '=' * (4 - len(encoded_id) % 4)).decode()
-        if ':' in decoded:
-            return decoded
-        return encoded_id
-    except Exception:
-        return encoded_id
+def _proxy_img(url: str) -> str:
+    # Proxy removed — return original image URL
+    return url
 
-def _deep_translate(obj):
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if key == 'id' and isinstance(value, str):
-                obj[key] = _translate_id(value)
-            elif isinstance(value, (dict, list)):
-                _deep_translate(value)
-    elif isinstance(obj, list):
-        for item in obj:
-            if isinstance(item, (dict, list)):
-                _deep_translate(item)
 
-def _decode_pipe_response(encoded_str: str) -> dict:
-    try:
-        encoded_str += '=' * (4 - len(encoded_str) % 4)
-        compressed = base64.urlsafe_b64decode(encoded_str)
-        return json.loads(gzip.decompress(compressed).decode('utf-8'))
-    except Exception:
-        raise ValueError("Failed to decode pipe response")
+def _proxy_deep_images(obj):
+    # Proxy removed — return data unchanged
+    return obj
 
-def _encode_pipe_request(payload: dict) -> str:
-    return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
-
-async def _anilist_query(query: str, variables: dict = None):
-    body = {"query": query}
-    if variables:
-        body["variables"] = variables
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.post(ANILIST_URL, json=body)
-        if res.status_code != 200:
-            raise HTTPException(status_code=500, detail="AniList query failed")
-        return res.json().get("data", {})
+def _inject_source_slugs(data: dict, anilist_id: int):
+    """Transform episode IDs into simplified path-based slugs: watch/PROV/ALID/CAT/PREFIX-NUMBER"""
+    providers = data.get("providers", {})
+    for provider_name, provider_data in providers.items():
+        if not isinstance(provider_data, dict):
+            continue
+        episodes = provider_data.get("episodes", {})
+        if not isinstance(episodes, dict):
+            # Some providers return a flat list — wrap it
+            if isinstance(episodes, list):
+                provider_data["episodes"] = {"sub": episodes}
+                episodes = provider_data["episodes"]
+            else:
+                continue
+        for category, ep_list in episodes.items():
+            if not isinstance(ep_list, list):
+                continue
+            for ep in ep_list:
+                if not isinstance(ep, dict):
+                    continue
+                if "id" in ep and "number" in ep:
+                    orig_id = ep["id"]
+                    prefix = orig_id.split(":")[0] if ":" in orig_id else orig_id
+                    ep["id"] = f"watch/{provider_name}/{anilist_id}/{category}/{prefix}-{ep['number']}"
+    return data
 
 async def _fetch_raw_episodes(anilist_id: int) -> dict:
+    """Internal helper to fetch raw, decoded episode data from Miruro pipe."""
     payload = {
         "path": "episodes",
         "method": "GET",
@@ -115,7 +119,8 @@ async def _fetch_raw_episodes(anilist_id: int) -> dict:
         _deep_translate(data)
         return data
 
-# ---------- GraphQL fragments ----------
+# ─── Shared GraphQL Fragments ────────────────────────────────────────────────
+
 MEDIA_LIST_FIELDS = """
     id
     title { romaji english native }
@@ -223,373 +228,312 @@ MEDIA_FULL_FIELDS = """
     }
 """
 
-# ---------- Helper: map AniList media to README's anime object ----------
-def _map_anime_basic(media: dict) -> dict:
-    return {
-        "id": str(media["id"]),
-        "name": media["title"].get("english") or media["title"].get("romaji") or "",
-        "jname": media["title"].get("native"),
-        "poster": media["coverImage"]["large"] if media.get("coverImage") else None,
-        "type": media.get("format"),
-        "episodes": {
-            "sub": media.get("episodes"),
-            "dub": None  # not available from AniList
-        }
-    }
+# ─── Utility Functions ───────────────────────────────────────────────────────
 
-def _map_anime_full(media: dict) -> dict:
-    return {
-        "id": str(media["id"]),
-        "animeId": str(media.get("idMal", media["id"])),
-        "name": media["title"].get("english") or media["title"].get("romaji") or "",
-        "jname": media["title"].get("native"),
-        "synonyms": ", ".join(media.get("synonyms", [])) if media.get("synonyms") else None,
-        "japanese": media["title"].get("native"),
-        "poster": media["coverImage"]["large"] if media.get("coverImage") else None,
-        "description": media.get("description"),
-        "type": media.get("format"),
-        "rating": str(media.get("averageScore")) if media.get("averageScore") else None,
-        "episodes": {
-            "sub": media.get("episodes"),
-            "dub": None
-        },
-        "duration": f"{media.get('duration')} min" if media.get("duration") else None,
-        "premiered": f"{media.get('season')} {media.get('seasonYear')}" if media.get("season") and media.get("seasonYear") else None,
-        "aired": _format_date(media.get("startDate")),
-        "broadcast": None,
-        "status": media.get("status"),
-        "score": str(media.get("averageScore")) if media.get("averageScore") else None,
-        "episodesTotal": media.get("episodes"),
-        "country": media.get("countryOfOrigin"),
-        "genres": media.get("genres", []),
-        "studios": [s["node"]["name"] for s in media.get("studios", {}).get("nodes", []) if s.get("node", {}).get("isAnimationStudio")],
-        "producers": [],
-        "malId": str(media.get("idMal")) if media.get("idMal") else None,
-        "alId": str(media["id"])
-    }
-
-def _format_date(date: dict) -> str:
-    if not date:
-        return None
-    parts = [str(date.get(y)) for y in ["year", "month", "day"] if date.get(y)]
-    return "-".join(parts) if parts else None
-
-def _generate_source_url(provider: str, anilist_id: int, category: str, prefix: str, episode_num: int) -> str:
-    # Build a URL that points to our own /watch endpoint (as per README)
-    slug = f"{prefix}-{episode_num}"
-    return f"/api/v2/{provider}/watch/{anilist_id}/{category}/{slug}"
-
-# ---------- Provider router wrapper ----------
-def _get_provider_or_default(provider: Optional[str]) -> str:
-    if provider in ["anikoto", "anikai"]:
-        return provider
-    return DEFAULT_PROVIDER
-
-def _provider_prefix(provider: str) -> str:
-    return f"/api/v2/{provider}"
-
-# ---------- Endpoints exactly as in README ----------
-@app.get("/")
-async def root():
-    return HTMLResponse("""<!DOCTYPE html><html><head><title>Anime API (Multi-Provider)</title></head><body><h1>Anime API</h1><p>See /docs for interactive documentation.</p></body></html>""")
-
-# ---- Home ----
-@app.get("/api/v2/{provider}/home")
-async def home(provider: str):
-    provider = _get_provider_or_default(provider)
-    # Fetch trending and popular for spotlight, latest, top10
-    gql_trending = f"""
-    query {{ Page(page: 1, perPage: 10) {{ media(sort: TRENDING_DESC, type: ANIME) {{ {MEDIA_LIST_FIELDS} }} }} }}
-    """
-    gql_popular = f"""
-    query {{ Page(page: 1, perPage: 10) {{ media(sort: POPULARITY_DESC, type: ANIME) {{ {MEDIA_LIST_FIELDS} }} }} }}
-    """
-    gql_upcoming = f"""
-    query {{ Page(page: 1, perPage: 10) {{ media(sort: POPULARITY_DESC, status: NOT_YET_RELEASED, type: ANIME) {{ {MEDIA_LIST_FIELDS} }} }} }}
-    """
-    gql_recent = f"""
-    query {{ Page(page: 1, perPage: 10) {{ media(sort: START_DATE_DESC, status: RELEASING, type: ANIME) {{ {MEDIA_LIST_FIELDS} }} }} }}
-    """
-    trending_data = await _anilist_query(gql_trending)
-    popular_data = await _anilist_query(gql_popular)
-    upcoming_data = await _anilist_query(gql_upcoming)
-    recent_data = await _anilist_query(gql_recent)
-
-    spotlight = []
-    for m in trending_data.get("Page", {}).get("media", [])[:5]:
-        spotlight.append({
-            "id": str(m["id"]),
-            "name": m["title"].get("english") or m["title"].get("romaji"),
-            "jname": m["title"].get("native"),
-            "poster": m["coverImage"]["large"] if m.get("coverImage") else None,
-            "description": None,  # AniList description not fetched in list query
-            "rating": str(m.get("averageScore")),
-            "rank": 0,
-            "otherInfo": [m.get("format"), m.get("status")],
-            "genres": m.get("genres", [])[:3],
-            "episodes": {"sub": m.get("episodes"), "dub": None}
-        })
-
-    latest_episodes = []
-    for m in recent_data.get("Page", {}).get("media", []):
-        latest_episodes.append(_map_anime_basic(m))
-
-    new_releases = []
-    for m in upcoming_data.get("Page", {}).get("media", [])[:6]:
-        new_releases.append(_map_anime_basic(m))
-
-    top_upcoming = []
-    for m in upcoming_data.get("Page", {}).get("media", [])[:10]:
-        top_upcoming.append(_map_anime_basic(m))
-
-    top10 = {
-        "today": [_map_anime_basic(m) for m in popular_data.get("Page", {}).get("media", [])[:10]],
-        "day": [],
-        "week": [],
-        "month": []
-    }
-
-    # Hardcoded genres for demo
-    genres = list(set([g for m in popular_data.get("Page", {}).get("media", []) for g in m.get("genres", [])]))[:15]
-
-    return {
-        "success": True,
-        "data": {
-            "genres": genres,
-            "spotlightAnimes": spotlight,
-            "latestEpisodeAnimes": latest_episodes,
-            "newReleases": new_releases,
-            "topUpcomingAnimes": top_upcoming,
-            "top10Animes": top10
-        }
-    }
-
-# ---- Index ----
-@app.get("/api/v2/{provider}/index")
-async def index(provider: str):
-    return {
-        "success": True,
-        "data": {
-            "meta": {
-                "title": "Anime API",
-                "description": "Free anime API",
-                "ogImage": "",
-                "canonical": ""
-            },
-            "mostSearched": [{"label": "Naruto", "keyword": "naruto"}, {"label": "One Piece", "keyword": "one piece"}],
-            "genres": ["Action", "Adventure", "Comedy", "Drama", "Fantasy", "Sci-Fi"],
-            "azList": [{"label": "All", "href": "/az-list/"}],
-            "footerMenu": [{"label": "DMCA", "href": "/pages/dmca"}]
-        }
-    }
-
-# ---- Nav ----
-@app.get("/api/v2/{provider}/nav")
-async def nav(provider: str):
-    provider = _get_provider_or_default(provider)
-    base_url = _provider_prefix(provider)
-    return {
-        "success": True,
-        "data": {
-            "header": {
-                "brand": {"link": "/", "logo": ""},
-                "buttons": {"menu": True, "search": True, "watch2gether": None, "random": None},
-                "search": {"action": f"{base_url}/search", "placeholder": "Search anime...", "filter_link": f"{base_url}/browse"},
-                "menu": {
-                    "genres": [
-                        {"name": "Action", "url": f"{base_url}/genre/action"},
-                        {"name": "Adventure", "url": f"{base_url}/genre/adventure"}
-                    ],
-                    "types": [
-                        {"name": "Movie", "url": f"{base_url}/type/movie"},
-                        {"name": "TV", "url": f"{base_url}/type/tv"}
-                    ],
-                    "links": [
-                        {"name": "Home", "url": f"{base_url}/home"},
-                        {"name": "Updated", "url": f"{base_url}/category/latest-updated"},
-                        {"name": "Popular", "url": f"{base_url}/category/most-viewed"}
-                    ]
-                },
-                "browse": {
-                    "url": f"{base_url}/browse",
-                    "sortOptions": [
-                        {"label": "Default", "value": "default"},
-                        {"label": "Score", "value": "score"}
-                    ],
-                    "filters": {
-                        "type": ["TV", "Movie"],
-                        "status": ["finished-airing", "currently-airing"],
-                        "season": ["fall", "summer", "spring", "winter"],
-                        "rating": ["PG", "PG-13"],
-                        "language": ["sub", "dub"]
-                    }
-                }
-            }
-        }
-    }
-
-# ---- Anime Details ----
-@app.get("/api/v2/{provider}/anime/{anime_id}")
-async def anime_details(provider: str, anime_id: str):
-    # anime_id can be AniList ID (int) or MAL ID. We'll try both.
+def _translate_id(encoded_id: str) -> str:
+    """Decode a base64-encoded episode ID back to plain text."""
     try:
-        aid = int(anime_id)
-    except:
-        # try to resolve by MAL id? For simplicity assume AniList id
-        raise HTTPException(400, "Anime ID must be integer (AniList ID)")
-    gql = f"""
-    query ($id: Int) {{ Media(id: $id, type: ANIME) {{ {MEDIA_FULL_FIELDS} }} }}
-    """
-    data = await _anilist_query(gql, {"id": aid})
-    media = data.get("Media")
-    if not media:
-        raise HTTPException(404, "Anime not found")
-    anime = _map_anime_full(media)
+        decoded = base64.urlsafe_b64decode(encoded_id + '=' * (4 - len(encoded_id) % 4)).decode()
+        if ':' in decoded:
+            return decoded
+        return encoded_id
+    except Exception:
+        return encoded_id
 
-    related = []
-    for edge in media.get("relations", {}).get("edges", []):
-        rel_node = edge["node"]
-        related.append({
-            "id": str(rel_node["id"]),
-            "name": rel_node["title"].get("english") or rel_node["title"].get("romaji"),
-            "jname": rel_node["title"].get("native"),
-            "poster": rel_node["coverImage"]["large"] if rel_node.get("coverImage") else None,
-            "type": rel_node.get("format"),
-            "relationType": edge.get("relationType"),
-            "episodes": {"sub": rel_node.get("episodes"), "dub": None}
-        })
 
-    recommended = []
-    for rec in media.get("recommendations", {}).get("nodes", []):
-        rec_media = rec.get("mediaRecommendation", {})
-        recommended.append({
-            "id": str(rec_media["id"]),
-            "name": rec_media["title"].get("english") or rec_media["title"].get("romaji"),
-            "poster": rec_media["coverImage"]["large"] if rec_media.get("coverImage") else None,
-            "type": rec_media.get("format"),
-            "episodes": {"sub": rec_media.get("episodes"), "dub": None}
-        })
+def _deep_translate(obj):
+    """Recursively walk a JSON structure and decode any base64 'id' fields."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key == 'id' and isinstance(value, str):
+                obj[key] = _translate_id(value)
+            elif isinstance(value, (dict, list)):
+                _deep_translate(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                _deep_translate(item)
 
-    seasons = []  # not directly available; could build from relations
-    return {
-        "success": True,
-        "data": {
-            "anime": anime,
-            "related": related,
-            "recommended": recommended,
-            "seasons": seasons
-        }
-    }
 
-# ---- Anime Episodes ----
-@app.get("/api/v2/{provider}/anime/{anime_id}/episodes")
-async def anime_episodes(provider: str, anime_id: str):
-    provider = _get_provider_or_default(provider)
+def _decode_pipe_response(encoded_str: str) -> dict:
+    """Decode a base64+gzip pipe response into a plain dict."""
     try:
-        aid = int(anime_id)
-    except:
-        raise HTTPException(400, "Anime ID must be integer")
-    raw = await _fetch_raw_episodes(aid)
-    # Get MAL/AL IDs from mappings
-    mappings = raw.get("mappings", {})
-    mal_id = mappings.get("malId")
-    al_id = mappings.get("anilistId")
+        encoded_str += '=' * (4 - len(encoded_str) % 4)
+        compressed = base64.urlsafe_b64decode(encoded_str)
+        return json.loads(gzip.decompress(compressed).decode('utf-8'))
+    except Exception:
+        raise ValueError("Failed to decode pipe response")
 
-    # Build episodes from the first provider that has episodes
-    all_eps = []
-    for prov_name, prov_data in raw.get("providers", {}).items():
-        ep_dict = prov_data.get("episodes", {})
-        for cat, eps in ep_dict.items():
-            if isinstance(eps, list):
-                for ep in eps:
-                    if not isinstance(ep, dict):
-                        continue
-                    ep_num = ep.get("number")
-                    if ep_num is None:
-                        continue
-                    orig_id = ep.get("id", "")
-                    prefix = orig_id.split(":")[0] if ":" in orig_id else prov_name
-                    # Build source URLs (point to our /watch endpoint)
-                    sub_url = _generate_source_url(provider, aid, "sub", prefix, ep_num) if cat == "sub" else None
-                    dub_url = _generate_source_url(provider, aid, "dub", prefix, ep_num) if cat == "dub" else None
-                    all_eps.append({
-                        "number": ep_num,
-                        "title": ep.get("title", f"Episode {ep_num}"),
-                        "isFiller": ep.get("filler", False),
-                        "hasSub": cat == "sub",
-                        "hasDub": cat == "dub",
-                        "sources": {
-                            "sub": sub_url,
-                            "dub": dub_url,
-                            "aniSub": None,
-                            "aniDub": None
-                        }
-                    })
-                break  # take first category that gave episodes
-        if all_eps:
-            break
 
-    all_eps.sort(key=lambda x: x["number"])
-    return {
-        "success": True,
-        "data": {
-            "totalEpisodes": len(all_eps),
-            "malId": str(mal_id) if mal_id else None,
-            "alId": str(al_id) if al_id else None,
-            "episodes": all_eps
-        }
-    }
+def _encode_pipe_request(payload: dict) -> str:
+    """Encode a dict into the base64 format expected by the pipe endpoint."""
+    return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
 
-# ---- Single Episode ----
-@app.get("/api/v2/{provider}/anime/{anime_id}/ep/{number}")
-async def single_episode(provider: str, anime_id: str, number: int):
-    provider = _get_provider_or_default(provider)
-    try:
-        aid = int(anime_id)
-    except:
-        raise HTTPException(400, "Invalid anime_id")
-    raw = await _fetch_raw_episodes(aid)
-    mappings = raw.get("mappings", {})
-    mal_id = mappings.get("malId")
-    al_id = mappings.get("anilistId")
 
-    for prov_name, prov_data in raw.get("providers", {}).items():
-        ep_dict = prov_data.get("episodes", {})
-        for cat, eps in ep_dict.items():
-            if isinstance(eps, list):
-                for ep in eps:
-                    if ep.get("number") == number:
-                        orig_id = ep.get("id", "")
-                        prefix = orig_id.split(":")[0] if ":" in orig_id else prov_name
-                        sub_url = _generate_source_url(provider, aid, "sub", prefix, number) if cat == "sub" else None
-                        dub_url = _generate_source_url(provider, aid, "dub", prefix, number) if cat == "dub" else None
-                        episode = {
-                            "number": number,
-                            "title": ep.get("title", f"Episode {number}"),
-                            "isFiller": ep.get("filler", False),
-                            "hasSub": cat == "sub",
-                            "hasDub": cat == "dub",
-                            "sources": {
-                                "sub": sub_url,
-                                "dub": dub_url,
-                                "aniSub": None,
-                                "aniDub": None
-                            }
-                        }
-                        return {
-                            "success": True,
-                            "data": {
-                                "malId": str(mal_id) if mal_id else None,
-                                "alId": str(al_id) if al_id else None,
-                                "episode": episode
-                            }
-                        }
-    raise HTTPException(404, f"Episode {number} not found")
+async def _anilist_query(query: str, variables: dict = None):
+    """Execute an AniList GraphQL query and return the data."""
+    body = {"query": query}
+    if variables:
+        body["variables"] = variables
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(ANILIST_URL, json=body)
+        if res.status_code != 200:
+            raise HTTPException(status_code=500, detail="AniList query failed")
+        return res.json().get("data", {})
 
-# ---- Search ----
-@app.get("/api/v2/{provider}/search")
-async def search(provider: str, q: str, page: int = 1, sort: Optional[str] = None, **filters):
-    provider = _get_provider_or_default(provider)
+
+# ─── Homepage ────────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Miruro API v2.0</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Outfit', sans-serif; transition: all 0.3s ease; }
+        body { background: radial-gradient(circle at top, #0f172a, #020617); color: #e2e8f0; min-height: 100vh; padding: 50px 20px; }
+        .container { max-width: 960px; margin: 0 auto; background: rgba(30, 41, 59, 0.5); backdrop-filter: blur(10px); padding: 40px; border-radius: 24px; border: 1px solid rgba(255, 255, 255, 0.05); box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+        .header { text-align: center; margin-bottom: 50px; }
+        .logo { width: 120px; border-radius: 20px; box-shadow: 0 0 30px rgba(56, 189, 248, 0.3); border: 1px solid rgba(255,255,255,0.1); margin-bottom: 25px; object-fit: cover; }
+        h1 { font-size: 3em; font-weight: 700; background: linear-gradient(to right, #38bdf8, #818cf8); -webkit-background-clip: text; color: transparent; margin-bottom: 10px; }
+        .subtitle { color: #94a3b8; font-size: 1.1em; font-weight: 300; }
+        .version { display: inline-block; background: rgba(56, 189, 248, 0.15); color: #38bdf8; padding: 4px 14px; border-radius: 20px; font-size: 0.85em; margin-top: 10px; border: 1px solid rgba(56, 189, 248, 0.2); }
+        .section-title { font-size: 1.3em; font-weight: 700; color: #818cf8; margin: 35px 0 15px; border-left: 3px solid #818cf8; padding-left: 12px; }
+        .endpoint { background: rgba(15, 23, 42, 0.8); border-left: 4px solid #38bdf8; padding: 25px; margin: 15px 0; border-radius: 0 16px 16px 0; border: 1px solid rgba(255,255,255,0.02); }
+        .endpoint:hover { transform: translateX(5px); box-shadow: 0 10px 20px rgba(0,0,0,0.2); border-left-color: #818cf8; background: rgba(30, 41, 59, 0.9); }
+        .method { color: #10b981; font-weight: 700; background: rgba(16, 185, 129, 0.1); padding: 4px 10px; border-radius: 6px; font-size: 0.9em; margin-right: 10px; }
+        .url { font-family: monospace; color: #cbd5e1; font-size: 1.1em; }
+        .params { margin-top: 10px; font-size: 0.85em; color: #64748b; font-family: monospace; line-height: 1.8; }
+        .params span { color: #a5b4fc; }
+        .example { margin-top: 15px; font-size: 0.95em; color: #64748b; }
+        a { color: #38bdf8; text-decoration: none; word-break: break-all; font-weight: 500; }
+        a:hover { color: #818cf8; text-shadow: 0 0 10px rgba(129, 140, 248, 0.5); }
+        .desc { color: #cbd5e1; font-size: 1em; margin-top: 10px; font-weight: 300; line-height: 1.6; }
+        .badge { display: inline-block; font-size: 0.7em; padding: 2px 8px; border-radius: 6px; margin-left: 8px; font-weight: 500; vertical-align: middle; }
+        .badge-new { background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); }
+        .badge-improved { background: rgba(129, 140, 248, 0.15); color: #818cf8; border: 1px solid rgba(129, 140, 248, 0.3); }
+        .returns { margin-top: 12px; font-size: 0.85em; color: #94a3b8; line-height: 1.6; }
+        .returns b { color: #a5b4fc; font-weight: 500; }
+        pre.snippet { background: #020617; padding: 14px; border-radius: 10px; margin-top: 12px; color: #a5b4fc; font-family: monospace; font-size: 0.82em; border: 1px solid rgba(255,255,255,0.05); overflow-x: auto; line-height: 1.5; }
+        .step-num { display: inline-block; background: rgba(56, 189, 248, 0.15); color: #38bdf8; width: 26px; height: 26px; text-align: center; line-height: 26px; border-radius: 50%; font-size: 0.85em; font-weight: 700; margin-right: 8px; }
+        .note { background: rgba(250, 204, 21, 0.08); border: 1px solid rgba(250, 204, 21, 0.15); border-radius: 10px; padding: 14px 18px; margin-top: 12px; font-size: 0.88em; color: #fbbf24; line-height: 1.5; }
+        .note b { color: #fde68a; }
+        table.param-table { width: 100%; margin-top: 12px; border-collapse: collapse; font-size: 0.85em; }
+        table.param-table th { text-align: left; color: #818cf8; font-weight: 500; padding: 6px 10px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+        table.param-table td { padding: 6px 10px; color: #94a3b8; border-bottom: 1px solid rgba(255,255,255,0.03); }
+        table.param-table td:first-child { color: #a5b4fc; font-family: monospace; white-space: nowrap; }
+        .footer { text-align: center; margin-top: 50px; color: #475569; font-size: 0.9em; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <img src="https://www.miruro.to/icon-512x512.png" alt="Logo" class="logo">
+            <h1>Miruro Native API</h1>
+            <div class="subtitle">Decrypted, bypassed, and reverse-engineered anime streaming API</div>
+            <div class="version">v2.0 — Full Data &amp; Pagination</div>
+        </div>
+
+        <div class="note" style="background: rgba(16, 185, 129, 0.08); border-color: rgba(16, 185, 129, 0.2); color: #10b981;">
+            <b>Global Image Proxying:</b> All images (covers, banners, posters) are now automatically proxied via <code>serveproxy.com</code> to prevent ISP blocking and CORS issues.
+        </div>
+
+        <!-- ───────── SEARCH & DISCOVERY ───────── -->
+        <div class="section-title">🔍 Search &amp; Discovery</div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/search</span></div>
+            <div class="desc">Search anime by name. Returns full metadata per result — title (romaji / english / native), cover art, banner, genres, studios, scores, airing status, and more.</div>
+            <div class="params">Params: <span>query</span> (required), <span>page</span>=1, <span>per_page</span>=20</div>
+            <div class="returns">Returns: <b>page</b>, <b>perPage</b>, <b>total</b>, <b>hasNextPage</b>, <b>results[]</b> — each with 20+ fields</div>
+            <div class="example">Try: <a target="_blank" href="/search?query=naruto&page=1&per_page=5">/search?query=naruto&page=1&per_page=5</a></div>
+        </div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/suggestions</span> <span class="badge badge-new">NEW</span></div>
+            <div class="desc">Lightweight search for autocomplete / dropdown. Returns only the essentials: id, title, poster, format, status, year, and episode count. Max 8 results.</div>
+            <div class="params">Params: <span>query</span> (required)</div>
+            <div class="returns">Returns: <b>suggestions[]</b> — each with: id, title, title_romaji, poster, format, status, year, episodes</div>
+            <div class="example">Try: <a target="_blank" href="/suggestions?query=one piece">/suggestions?query=one piece</a></div>
+        </div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/spotlight</span> <span class="badge badge-new">HOT</span></div>
+            <div class="desc">The ultra-curated "What's Hot" list. Fetches the top 10 anime currently trending and popular across the globe. Perfect for hero banners and home carousels.</div>
+            <div class="example">Try: <a target="_blank" href="/spotlight">/spotlight</a></div>
+        </div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/filter</span> <span class="badge badge-new">NEW</span></div>
+            <div class="desc">Advanced filter / browse. Combine any filters — all params are optional.</div>
+            <table class="param-table">
+                <tr><th>Param</th><th>Values</th></tr>
+                <tr><td>genre</td><td>Action, Romance, Comedy, Drama, Fantasy, Sci-Fi, etc.</td></tr>
+                <tr><td>tag</td><td>Isekai, Time Skip, Reincarnation, etc.</td></tr>
+                <tr><td>year</td><td>2025, 2024, etc.</td></tr>
+                <tr><td>season</td><td>WINTER · SPRING · SUMMER · FALL</td></tr>
+                <tr><td>format</td><td>TV · MOVIE · OVA · ONA · SPECIAL</td></tr>
+                <tr><td>status</td><td>RELEASING · FINISHED · NOT_YET_RELEASED · CANCELLED</td></tr>
+                <tr><td>sort</td><td>SCORE_DESC · POPULARITY_DESC · TRENDING_DESC · START_DATE_DESC</td></tr>
+                <tr><td>page / per_page</td><td>Pagination (default 1 / 20)</td></tr>
+            </table>
+            <div class="example">Try: <a target="_blank" href="/filter?genre=Action&format=TV&sort=SCORE_DESC&per_page=5">/filter?genre=Action&format=TV&sort=SCORE_DESC&per_page=5</a></div>
+        </div>
+
+        <!-- ───────── COLLECTIONS ───────── -->
+        <div class="section-title">📊 Collections (Paginated)</div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/trending</span></div>
+            <div class="desc">Currently trending anime across the community.</div>
+            <div class="params">Params: <span>page</span>=1, <span>per_page</span>=20</div>
+            <div class="example">Try: <a target="_blank" href="/trending?per_page=5">/trending?per_page=5</a></div>
+        </div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/popular</span></div>
+            <div class="desc">Most popular anime of all time by total user count.</div>
+            <div class="params">Params: <span>page</span>=1, <span>per_page</span>=20</div>
+            <div class="example">Try: <a target="_blank" href="/popular">/popular</a></div>
+        </div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/upcoming</span></div>
+            <div class="desc">Most anticipated anime that haven't aired yet.</div>
+            <div class="params">Params: <span>page</span>=1, <span>per_page</span>=20</div>
+            <div class="example">Try: <a target="_blank" href="/upcoming">/upcoming</a></div>
+        </div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/recent</span></div>
+            <div class="desc">Currently airing / this season's anime.</div>
+            <div class="params">Params: <span>page</span>=1, <span>per_page</span>=20</div>
+            <div class="example">Try: <a target="_blank" href="/recent">/recent</a></div>
+        </div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/schedule</span></div>
+            <div class="desc">Next episodes airing soon. Each result includes the full anime info plus <b>airingAt</b> (UNIX timestamp), <b>timeUntilAiring</b> (seconds), and <b>next_episode</b> (episode number).</div>
+            <div class="params">Params: <span>page</span>=1, <span>per_page</span>=20</div>
+            <div class="example">Try: <a target="_blank" href="/schedule">/schedule</a></div>
+        </div>
+
+        <!-- ───────── ANIME DETAILS ───────── -->
+        <div class="section-title">📖 Anime Details</div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/info/{anilist_id}</span></div>
+            <div class="desc">Complete anime page — <b>everything</b> you need to build an anime detail page in one request.</div>
+            <div class="returns">Returns all of: title (romaji/english/native), description, coverImage, bannerImage, format, season, seasonYear, episodes, duration, status, averageScore, meanScore, popularity, favourites, genres, <b>tags</b> (with rank), <b>studios</b>, <b>characters</b> (25, with voice actors), <b>staff</b> (25, with roles), <b>relations</b> (sequels/prequels/etc.), <b>recommendations</b> (10), <b>trailer</b>, <b>externalLinks</b> (MAL, official site), <b>streamingEpisodes</b>, <b>stats</b> (score &amp; status distribution), synonyms, siteUrl, idMal, and more.</div>
+            <div class="example">Try: <a target="_blank" href="/info/20">/info/20</a> (Naruto) · <a target="_blank" href="/info/21">/info/21</a> (One Piece)</div>
+        </div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/anime/{id}/characters</span></div>
+            <div class="desc">Paginated character list. Each character includes name, image, role (MAIN/SUPPORTING), and Japanese voice actors with images.</div>
+            <div class="params">Params: <span>page</span>=1, <span>per_page</span>=25</div>
+            <div class="example">Try: <a target="_blank" href="/anime/20/characters">/anime/20/characters</a></div>
+        </div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/anime/{id}/relations</span></div>
+            <div class="desc">All related media — sequels, prequels, side stories, spin-offs, source material. Each entry has type (SEQUEL/PREQUEL/etc.), format, and basic metadata.</div>
+            <div class="example">Try: <a target="_blank" href="/anime/20/relations">/anime/20/relations</a></div>
+        </div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/anime/{id}/recommendations</span></div>
+            <div class="desc">Community recommendations — "if you liked X, you'll like Y". Sorted by highest rating.</div>
+            <div class="params">Params: <span>page</span>=1, <span>per_page</span>=10</div>
+            <div class="example">Try: <a target="_blank" href="/anime/20/recommendations">/anime/20/recommendations</a></div>
+        </div>
+
+        <!-- ───────── STREAMING ───────── -->
+        <div class="section-title">▶️ Streaming (3-Step Flow)</div>
+
+        <div class="note">
+            <b>How streaming works:</b> To get a video URL, follow these 3 steps in order. Each step's output feeds into the next.
+        </div>
+
+        <div class="endpoint">
+            <div><span class="step-num">1</span><span class="method">GET</span> <span class="url">/episodes/{anilist_id}</span></div>
+            <div class="desc">Get all available episodes for an anime. Returns episodes from multiple providers (kiwi, arc, zoro, jet, etc.) organized by audio type (sub / dub).</div>
+            <div class="returns">Returns: <b>mappings</b> (cross-reference IDs for AniList, MAL, Kitsu) + <b>providers</b> (episode lists per provider)</div>
+            <pre class="snippet">{
+  "mappings": { "anilistId": 178005, "malId": 56885, ... },
+  "providers": {
+    "kiwi": {
+      "episodes": {
+        "sub": [
+          {
+            "id": "watch/kiwi/178005/sub/animepahe-1",   ← use this strictly
+            "number": 1,
+            "title": "Episode Title",
+            "image": "https://...",
+            "airDate": "2026-01-04",
+            "duration": 1420,
+            "description": "...",
+            "filler": false
+          }
+        ],
+        "dub": [ ... ]
+      }
+    },
+    "arc": { ... },
+    "zoro": { ... }
+  }
+}</pre>
+            <div class="example">Try: <a target="_blank" href="/episodes/178005">/episodes/178005</a></div>
+        </div>
+
+        <div class="endpoint" style="border-left-color: #10b981; background: rgba(16, 185, 129, 0.05);">
+            <div><span class="step-num">2</span> <span class="url">/watch/{provider}/{anilistId}/{category}/{slug}</span> <span class="badge badge-new">RECOMMENDED</span></div>
+            <div class="desc">The super simple way to get sources. Just take the direct <b>id</b> from the Step 1 response and use it as the URL. No manual parameters needed!</div>
+            <div class="example">Try: <a target="_blank" href="/watch/kiwi/178005/sub/animepahe-1">/watch/kiwi/178005/sub/animepahe-1</a></div>
+            
+            <pre class="snippet">{
+  "streams": [
+    { "url": "https://.../master.m3u8", "type": "hls", "quality": "1080p" }
+  ],
+  "subtitles": [ { "file": "...", "label": "English" } ],
+  "intro": { "start": 0, "end": 90 },
+  "outro": { "start": 1300, "end": 1420 }
+}</pre>
+
+            <div style="margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 15px;">
+                <span style="font-size: 0.85em; color: #64748b; font-weight: 500;">DETAILED OPTION:</span>
+                <div class="desc" style="font-size: 0.9em; opacity: 0.7;"><code>GET /sources?episodeId=...&provider=...&anilistId=...&category=...</code></div>
+            </div>
+        </div>
+
+        <div class="endpoint" style="border-left-color: #818cf8;">
+            <div><span class="step-num">3</span> <span class="url" style="color: #818cf8;">Play the stream</span></div>
+            <div class="desc">Take the <b>streams[0].url</b> from Step 2 and feed it into any HLS-compatible player (Video.js, hls.js, VLC, mpv, etc.). Subtitles are either hard-subbed (kiwi/pahe) or provided in the <b>subtitles</b> array (zoro/arc). Use <b>intro/outro</b> timestamps for skip buttons.</div>
+        </div>
+
+        <div class="footer">
+            All collection endpoints return paginated responses: <span style="color: #a5b4fc; font-family: monospace;">{ page, perPage, total, hasNextPage, results[] }</span>
+            <br><br>
+            Developed by Walter | <a href="https://github.com/walterwhite-69" target="_blank">github.com/walterwhite-69</a>
+        </div>
+    </div>
+</body>
+</html>"""
+
+
+# ─── Search & Suggestions ───────────────────────────────────────────────────
+
+@app.get("/search")
+async def search_anime(
+    query: str,
+    page: int = Query(1, ge=1, description="Page number"),
+    per_page: int = Query(20, ge=1, le=50, description="Results per page"),
+):
+    """Search for anime by name via AniList GraphQL — returns full metadata."""
     gql = f"""
     query ($search: String, $page: Int, $perPage: Int) {{
         Page(page: $page, perPage: $perPage) {{
@@ -600,245 +544,484 @@ async def search(provider: str, q: str, page: int = 1, sort: Optional[str] = Non
         }}
     }}
     """
-    per_page = 20
-    data = await _anilist_query(gql, {"search": q, "page": page, "perPage": per_page})
+    data = await _anilist_query(gql, {"search": query, "page": page, "perPage": per_page})
     page_data = data.get("Page", {})
-    animes = [_map_anime_basic(m) for m in page_data.get("media", [])]
     page_info = page_data.get("pageInfo", {})
-    return {
-        "success": True,
-        "data": {
-            "animes": animes,
-            "currentPage": page_info.get("currentPage", page),
-            "totalPages": page_info.get("lastPage", 1),
-            "hasNextPage": page_info.get("hasNextPage", False),
-            "totalCount": page_info.get("total"),
-            "searchQuery": q,
-            "searchFilters": {}
+    response = {
+        "page": page_info.get("currentPage", page),
+        "perPage": page_info.get("perPage", per_page),
+        "total": page_info.get("total", 0),
+        "hasNextPage": page_info.get("hasNextPage", False),
+        "results": page_data.get("media", []),
+    }
+    return _proxy_deep_images(response)
+
+
+@app.get("/suggestions")
+async def search_suggestions(
+    query: str = Query(..., min_length=1, description="Search query for autocomplete"),
+):
+    """Lightweight search for dropdown autocomplete — returns minimal data fast."""
+    gql = """
+    query ($search: String) {
+        Page(page: 1, perPage: 8) {
+            media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
+                id
+                title { romaji english }
+                coverImage { large }
+                format
+                status
+                startDate { year }
+                episodes
+            }
         }
     }
+    """
+    data = await _anilist_query(gql, {"search": query})
+    results = []
+    for item in data.get("Page", {}).get("media", []):
+        results.append({
+            "id": item["id"],
+            "title": item["title"].get("english") or item["title"].get("romaji"),
+            "title_romaji": item["title"].get("romaji"),
+            "poster": item["coverImage"]["large"],
+            "format": item.get("format"),
+            "status": item.get("status"),
+            "year": (item.get("startDate") or {}).get("year"),
+            "episodes": item.get("episodes"),
+        })
+    return _proxy_deep_images({"suggestions": results})
 
-# ---- Browse (same as search but without mandatory q) ----
-@app.get("/api/v2/{provider}/browse")
-async def browse(provider: str, keyword: Optional[str] = None, page: int = 1, sort: str = "default", **filters):
-    if keyword:
-        return await search(provider, keyword, page, sort)
-    # fallback to popular
+
+# ─── Advanced Filter ─────────────────────────────────────────────────────────
+
+SORT_MAP = {
+    "SCORE_DESC": "SCORE_DESC",
+    "POPULARITY_DESC": "POPULARITY_DESC",
+    "TRENDING_DESC": "TRENDING_DESC",
+    "START_DATE_DESC": "START_DATE_DESC",
+    "FAVOURITES_DESC": "FAVOURITES_DESC",
+    "UPDATED_AT_DESC": "UPDATED_AT_DESC",
+}
+
+@app.get("/filter")
+async def filter_anime(
+    genre: Optional[str] = Query(None, description="Genre name, e.g. Action, Romance"),
+    tag: Optional[str] = Query(None, description="Tag name, e.g. Isekai, Time Skip"),
+    year: Optional[int] = Query(None, description="Season year, e.g. 2025"),
+    season: Optional[str] = Query(None, description="WINTER, SPRING, SUMMER, or FALL"),
+    format: Optional[str] = Query(None, description="TV, MOVIE, OVA, ONA, SPECIAL, MUSIC"),
+    status: Optional[str] = Query(None, description="RELEASING, FINISHED, NOT_YET_RELEASED, CANCELLED, HIATUS"),
+    sort: str = Query("POPULARITY_DESC", description="Sort order"),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=50),
+):
+    """Advanced anime filter with genre, tag, year, season, format, status, and sort."""
+    # Build dynamic argument string
+    args = ["type: ANIME", f"sort: [{SORT_MAP.get(sort, 'POPULARITY_DESC')}]"]
+    variables = {"page": page, "perPage": per_page}
+
+    if genre:
+        args.append("genre: $genre")
+        variables["genre"] = genre
+    if tag:
+        args.append("tag: $tag")
+        variables["tag"] = tag
+    if year:
+        args.append("seasonYear: $seasonYear")
+        variables["seasonYear"] = year
+    if season:
+        args.append("season: $season")
+        variables["season"] = season.upper()
+    if format:
+        args.append("format: $format")
+        variables["format"] = format.upper()
+    if status:
+        args.append("status: $status")
+        variables["status"] = status.upper()
+
+    # Build variable type declarations
+    var_types = ["$page: Int", "$perPage: Int"]
+    if genre:
+        var_types.append("$genre: String")
+    if tag:
+        var_types.append("$tag: String")
+    if year:
+        var_types.append("$seasonYear: Int")
+    if season:
+        var_types.append("$season: MediaSeason")
+    if format:
+        var_types.append("$format: MediaFormat")
+    if status:
+        var_types.append("$status: MediaStatus")
+
+    gql = f"""
+    query ({', '.join(var_types)}) {{
+        Page(page: $page, perPage: $perPage) {{
+            pageInfo {{ total currentPage lastPage hasNextPage perPage }}
+            media({', '.join(args)}) {{
+                {MEDIA_LIST_FIELDS}
+            }}
+        }}
+    }}
+    """
+    data = await _anilist_query(gql, variables)
+    page_data = data.get("Page", {})
+    page_info = page_data.get("pageInfo", {})
+    response = {
+        "page": page_info.get("currentPage", page),
+        "perPage": page_info.get("perPage", per_page),
+        "total": page_info.get("total", 0),
+        "hasNextPage": page_info.get("hasNextPage", False),
+        "results": page_data.get("media", []),
+    }
+    return _proxy_deep_images(response)
+
+
+# ─── Collection Endpoints (with pagination) ─────────────────────────────────
+
+async def _fetch_collection(sort_type: str, status: str = None, page: int = 1, per_page: int = 20):
+    """Internal helper for fetching collections like trending, popular, etc."""
+    status_filter = f", status: {status}" if status else ""
     gql = f"""
     query ($page: Int, $perPage: Int) {{
         Page(page: $page, perPage: $perPage) {{
             pageInfo {{ total currentPage lastPage hasNextPage perPage }}
-            media(type: ANIME, sort: POPULARITY_DESC) {{
+            media(type: ANIME, sort: [{sort_type}]{status_filter}) {{
                 {MEDIA_LIST_FIELDS}
             }}
         }}
     }}
     """
-    per_page = 20
     data = await _anilist_query(gql, {"page": page, "perPage": per_page})
     page_data = data.get("Page", {})
-    animes = [_map_anime_basic(m) for m in page_data.get("media", [])]
     page_info = page_data.get("pageInfo", {})
-    return {
-        "success": True,
-        "data": {
-            "animes": animes,
-            "currentPage": page_info.get("currentPage", page),
-            "totalPages": page_info.get("lastPage", 1),
-            "hasNextPage": page_info.get("hasNextPage", False),
-            "totalCount": page_info.get("total"),
-            "filters": {}
-        }
+    response = {
+        "page": page_info.get("currentPage", page),
+        "perPage": page_info.get("perPage", per_page),
+        "total": page_info.get("total", 0),
+        "hasNextPage": page_info.get("hasNextPage", False),
+        "results": page_data.get("media", []),
     }
+    return _proxy_deep_images(response)
 
-# ---- A-Z List ----
-@app.get("/api/v2/{provider}/azlist/{sort_option}")
-async def azlist(provider: str, sort_option: str, page: int = 1):
-    # Use search with a dummy char filter (simplified)
-    return await search(provider, sort_option if len(sort_option) == 1 else "", page)
 
-# ---- Genre ----
-@app.get("/api/v2/{provider}/genre/{genre_name}")
-async def genre_animes(provider: str, genre_name: str, page: int = 1, sort: Optional[str] = None):
+@app.get("/spotlight")
+async def get_spotlight():
+    """Get the spotlight anime – high-priority trending and popular titles."""
     gql = f"""
-    query ($genre: String, $page: Int, $perPage: Int) {{
-        Page(page: $page, perPage: $perPage) {{
-            pageInfo {{ total currentPage lastPage hasNextPage perPage }}
-            media(genre: $genre, type: ANIME, sort: POPULARITY_DESC) {{
+    query {{
+        Page(page: 1, perPage: 10) {{
+            media(sort: [TRENDING_DESC, POPULARITY_DESC], type: ANIME) {{
                 {MEDIA_LIST_FIELDS}
             }}
         }}
     }}
     """
-    per_page = 20
-    data = await _anilist_query(gql, {"genre": genre_name.title(), "page": page, "perPage": per_page})
-    page_data = data.get("Page", {})
-    animes = [_map_anime_basic(m) for m in page_data.get("media", [])]
-    page_info = page_data.get("pageInfo", {})
-    return {
-        "success": True,
-        "data": {
-            "genreName": genre_name,
-            "animes": animes,
-            "currentPage": page_info.get("currentPage", page),
-            "totalPages": page_info.get("lastPage", 1),
-            "hasNextPage": page_info.get("hasNextPage", False)
-        }
-    }
+    data = await _anilist_query(gql)
+    media = data.get("Page", {}).get("media", [])
+    return _proxy_deep_images({"results": media})
 
-# ---- Category ----
-@app.get("/api/v2/{provider}/category/{category_name}")
-async def category_animes(provider: str, category_name: str, page: int = 1, sort: Optional[str] = None):
-    # map category to status/format
-    sort_map = {"latest-updated": "START_DATE_DESC", "most-viewed": "POPULARITY_DESC", "tv": "POPULARITY_DESC"}
-    sort_val = sort_map.get(category_name, "POPULARITY_DESC")
+
+@app.get("/trending")
+async def get_trending(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=50),
+):
+    """Get trending anime with full metadata and pagination."""
+    return await _fetch_collection("TRENDING_DESC", page=page, per_page=per_page)
+
+
+@app.get("/popular")
+async def get_popular(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=50),
+):
+    """Get most popular anime of all time with full metadata and pagination."""
+    return await _fetch_collection("POPULARITY_DESC", page=page, per_page=per_page)
+
+
+@app.get("/upcoming")
+async def get_upcoming(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=50),
+):
+    """Get upcoming anime with full metadata and pagination."""
+    return await _fetch_collection("POPULARITY_DESC", "NOT_YET_RELEASED", page=page, per_page=per_page)
+
+
+@app.get("/recent")
+async def get_recent(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=50),
+):
+    """Get currently airing anime with full metadata and pagination."""
+    return await _fetch_collection("START_DATE_DESC", "RELEASING", page=page, per_page=per_page)
+
+
+@app.get("/schedule")
+async def get_schedule(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=50),
+):
+    """Get upcoming airing schedule with UNIX timestamps and full anime metadata."""
     gql = f"""
     query ($page: Int, $perPage: Int) {{
         Page(page: $page, perPage: $perPage) {{
             pageInfo {{ total currentPage lastPage hasNextPage perPage }}
-            media(type: ANIME, sort: {sort_val}) {{
-                {MEDIA_LIST_FIELDS}
+            airingSchedules(notYetAired: true, sort: TIME) {{
+                episode
+                airingAt
+                timeUntilAiring
+                media {{
+                    {MEDIA_LIST_FIELDS}
+                }}
             }}
         }}
     }}
     """
-    per_page = 20
     data = await _anilist_query(gql, {"page": page, "perPage": per_page})
     page_data = data.get("Page", {})
-    animes = [_map_anime_basic(m) for m in page_data.get("media", [])]
     page_info = page_data.get("pageInfo", {})
-    return {
-        "success": True,
-        "data": {
-            "category": category_name,
-            "animes": animes,
-            "currentPage": page_info.get("currentPage", page),
-            "totalPages": page_info.get("lastPage", 1),
-            "hasNextPage": page_info.get("hasNextPage", False)
-        }
+    results = []
+    for item in page_data.get("airingSchedules", []):
+        entry = item.get("media", {})
+        entry["next_episode"] = item.get("episode")
+        entry["airingAt"] = item.get("airingAt")
+        entry["timeUntilAiring"] = item.get("timeUntilAiring")
+        results.append(entry)
+    response = {
+        "page": page_info.get("currentPage", page),
+        "perPage": page_info.get("perPage", per_page),
+        "total": page_info.get("total", 0),
+        "hasNextPage": page_info.get("hasNextPage", False),
+        "results": results,
     }
+    return _proxy_deep_images(response)
 
-# ---- Type ----
-@app.get("/api/v2/{provider}/type/{type_name}")
-async def type_animes(provider: str, type_name: str, page: int = 1, sort: Optional[str] = None):
-    format_map = {"movie": "MOVIE", "tv": "TV", "ova": "OVA", "ona": "ONA", "special": "SPECIAL", "music": "MUSIC"}
-    fmt = format_map.get(type_name.lower(), "TV")
+
+# ─── Anime Details ───────────────────────────────────────────────────────────
+
+@app.get("/info/{anilist_id}")
+async def get_anime_info(anilist_id: int):
+    """Get complete anime page data — everything AniList has to offer."""
     gql = f"""
-    query ($format: MediaFormat, $page: Int, $perPage: Int) {{
-        Page(page: $page, perPage: $perPage) {{
-            pageInfo {{ total currentPage lastPage hasNextPage perPage }}
-            media(format: $format, type: ANIME, sort: POPULARITY_DESC) {{
-                {MEDIA_LIST_FIELDS}
-            }}
+    query ($id: Int) {{
+        Media(id: $id, type: ANIME) {{
+            {MEDIA_FULL_FIELDS}
         }}
     }}
     """
-    per_page = 20
-    data = await _anilist_query(gql, {"format": fmt, "page": page, "perPage": per_page})
-    page_data = data.get("Page", {})
-    animes = [_map_anime_basic(m) for m in page_data.get("media", [])]
-    page_info = page_data.get("pageInfo", {})
-    return {
-        "success": True,
-        "data": {
-            "type": type_name,
-            "animes": animes,
-            "currentPage": page_info.get("currentPage", page),
-            "totalPages": page_info.get("lastPage", 1),
-            "hasNextPage": page_info.get("hasNextPage", False)
+    data = await _anilist_query(gql, {"id": anilist_id})
+    media = data.get("Media")
+    if not media:
+        raise HTTPException(status_code=404, detail="Anime not found")
+    return _proxy_deep_images(media)
+
+
+@app.get("/anime/{anilist_id}/characters")
+async def get_anime_characters(
+    anilist_id: int,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(25, ge=1, le=50),
+):
+    """Get paginated character list with voice actors for an anime."""
+    gql = """
+    query ($id: Int, $page: Int, $perPage: Int) {
+        Media(id: $id, type: ANIME) {
+            id
+            title { romaji english }
+            characters(sort: [ROLE, RELEVANCE], page: $page, perPage: $perPage) {
+                pageInfo { total currentPage lastPage hasNextPage perPage }
+                edges {
+                    role
+                    node {
+                        id
+                        name { full native userPreferred }
+                        image { large medium }
+                        description
+                        gender
+                        dateOfBirth { year month day }
+                        age
+                        favourites
+                        siteUrl
+                    }
+                    voiceActors {
+                        id
+                        name { full native }
+                        image { large }
+                        languageV2
+                    }
+                }
+            }
         }
     }
+    """
+    data = await _anilist_query(gql, {"id": anilist_id, "page": page, "perPage": per_page})
+    media = data.get("Media")
+    if not media:
+        raise HTTPException(status_code=404, detail="Anime not found")
+    chars = media.get("characters", {})
+    page_info = chars.get("pageInfo", {})
+    response = {
+        "page": page_info.get("currentPage", page),
+        "perPage": page_info.get("perPage", per_page),
+        "total": page_info.get("total", 0),
+        "hasNextPage": page_info.get("hasNextPage", False),
+        "characters": chars.get("edges", []),
+    }
+    return _proxy_deep_images(response)
 
-# ---- Watch endpoint (for sources resolution) ----
-@app.get("/api/v2/{provider}/watch/{anilist_id}/{category}/{slug}")
-async def watch_sources(provider: str, anilist_id: int, category: str, slug: str):
-    # Resolve slug to original episode ID
-    raw = await _fetch_raw_episodes(anilist_id)
-    for prov_name, prov_data in raw.get("providers", {}).items():
-        ep_dict = prov_data.get("episodes", {})
-        for cat, eps in ep_dict.items():
-            if cat != category:
-                continue
-            if isinstance(eps, list):
-                for ep in eps:
-                    orig_id = ep.get("id", "")
-                    prefix = orig_id.split(":")[0] if ":" in orig_id else prov_name
-                    generated = f"{prefix}-{ep.get('number')}"
-                    if generated == slug:
-                        # Now call the original sources endpoint
-                        enc_id = base64.urlsafe_b64encode(orig_id.encode()).decode().rstrip('=')
-                        payload = {
-                            "path": "sources",
-                            "method": "GET",
-                            "query": {
-                                "episodeId": enc_id,
-                                "provider": prov_name,
-                                "category": category,
-                                "anilistId": anilist_id,
-                            },
-                            "body": None,
-                            "version": "0.1.0",
-                        }
-                        encoded_req = _encode_pipe_request(payload)
-                        async with httpx.AsyncClient(timeout=15.0) as client:
-                            res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
-                            if res.status_code != 200:
-                                raise HTTPException(500, "Failed to fetch sources")
-                            sources_data = _decode_pipe_response(res.text.strip())
-                            _deep_translate(sources_data)
-                            return sources_data
-    raise HTTPException(404, "Episode not found")
 
-# ---- Shorthand routes (without provider prefix) ----
-@app.get("/api/home")
-async def shorthand_home(provider: Optional[str] = Query(None)):
-    return await home(provider or DEFAULT_PROVIDER)
+@app.get("/anime/{anilist_id}/relations")
+async def get_anime_relations(anilist_id: int):
+    """Get all related anime/manga for an anime (sequels, prequels, side stories, etc.)."""
+    gql = """
+    query ($id: Int) {
+        Media(id: $id, type: ANIME) {
+            id
+            title { romaji english }
+            relations {
+                edges {
+                    relationType(version: 2)
+                    node {
+                        id
+                        title { romaji english native }
+                        coverImage { large }
+                        bannerImage
+                        format
+                        type
+                        status
+                        episodes
+                        chapters
+                        meanScore
+                        averageScore
+                        popularity
+                        startDate { year month day }
+                    }
+                }
+            }
+        }
+    }
+    """
+    data = await _anilist_query(gql, {"id": anilist_id})
+    media = data.get("Media")
+    if not media:
+        raise HTTPException(status_code=404, detail="Anime not found")
+    response = {
+        "id": media["id"],
+        "title": media["title"],
+        "relations": media.get("relations", {}).get("edges", []),
+    }
+    return _proxy_deep_images(response)
 
-@app.get("/api/index")
-async def shorthand_index(provider: Optional[str] = Query(None)):
-    return await index(provider or DEFAULT_PROVIDER)
 
-@app.get("/api/nav")
-async def shorthand_nav(provider: Optional[str] = Query(None)):
-    return await nav(provider or DEFAULT_PROVIDER)
+@app.get("/anime/{anilist_id}/recommendations")
+async def get_anime_recommendations(
+    anilist_id: int,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(10, ge=1, le=25),
+):
+    """Get paginated community recommendations for an anime."""
+    gql = """
+    query ($id: Int, $page: Int, $perPage: Int) {
+        Media(id: $id, type: ANIME) {
+            id
+            title { romaji english }
+            recommendations(sort: RATING_DESC, page: $page, perPage: $perPage) {
+                pageInfo { total currentPage lastPage hasNextPage perPage }
+                nodes {
+                    rating
+                    mediaRecommendation {
+                        id
+                        title { romaji english native }
+                        coverImage { large extraLarge }
+                        bannerImage
+                        format
+                        episodes
+                        status
+                        meanScore
+                        averageScore
+                        popularity
+                        genres
+                        startDate { year }
+                    }
+                }
+            }
+        }
+    }
+    """
+    data = await _anilist_query(gql, {"id": anilist_id, "page": page, "perPage": per_page})
+    media = data.get("Media")
+    if not media:
+        raise HTTPException(status_code=404, detail="Anime not found")
+    recs = media.get("recommendations", {})
+    page_info = recs.get("pageInfo", {})
+    response = {
+        "page": page_info.get("currentPage", page),
+        "perPage": page_info.get("perPage", per_page),
+        "total": page_info.get("total", 0),
+        "hasNextPage": page_info.get("hasNextPage", False),
+        "recommendations": recs.get("nodes", []),
+    }
+    return _proxy_deep_images(response)
 
-@app.get("/api/anime/{anime_id}")
-async def shorthand_details(anime_id: str, provider: Optional[str] = Query(None)):
-    return await anime_details(provider or DEFAULT_PROVIDER, anime_id)
 
-@app.get("/api/anime/{anime_id}/episodes")
-async def shorthand_episodes(anime_id: str, provider: Optional[str] = Query(None)):
-    return await anime_episodes(provider or DEFAULT_PROVIDER, anime_id)
+# ─── Streaming (Pipe-based — unchanged logic) ───────────────────────────────
 
-@app.get("/api/anime/{anime_id}/ep/{number}")
-async def shorthand_single_ep(anime_id: str, number: int, provider: Optional[str] = Query(None)):
-    return await single_episode(provider or DEFAULT_PROVIDER, anime_id, number)
+@app.get("/episodes/{anilist_id}")
+async def get_episodes(anilist_id: int):
+    """Get the episode list for an anime, with slugified source IDs."""
+    data = await _fetch_raw_episodes(anilist_id)
+    return _proxy_deep_images(_inject_source_slugs(data, anilist_id))
 
-@app.get("/api/search")
-async def shorthand_search(q: str, page: int = 1, provider: Optional[str] = Query(None)):
-    return await search(provider or DEFAULT_PROVIDER, q, page)
 
-@app.get("/api/browse")
-async def shorthand_browse(keyword: Optional[str] = None, page: int = 1, provider: Optional[str] = Query(None)):
-    return await browse(provider or DEFAULT_PROVIDER, keyword, page)
+@app.get("/sources")
+async def get_sources(
+    episodeId: str = Query(..., description="Plain-text episode ID from /episodes response"),
+    provider: str = Query(..., description="Provider name, e.g. kiwi, arc, telli"),
+    anilistId: int = Query(..., description="AniList anime ID"),
+    category: str = Query("sub", description="sub or dub"),
+):
+    """Get M3U8 streaming sources for a specific episode."""
+    enc_id = base64.urlsafe_b64encode(episodeId.encode()).decode().rstrip('=')
+    payload = {
+        "path": "sources",
+        "method": "GET",
+        "query": {
+            "episodeId": enc_id,
+            "provider": provider,
+            "category": category,
+            "anilistId": anilistId,
+        },
+        "body": None,
+        "version": "0.1.0",
+    }
+    encoded_req = _encode_pipe_request(payload)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
+        if res.status_code != 200:
+            raise HTTPException(status_code=res.status_code, detail="Pipe request failed")
+        return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
 
-@app.get("/api/genre/{name}")
-async def shorthand_genre(name: str, page: int = 1, provider: Optional[str] = Query(None)):
-    return await genre_animes(provider or DEFAULT_PROVIDER, name, page)
-
-@app.get("/api/category/{name}")
-async def shorthand_category(name: str, page: int = 1, provider: Optional[str] = Query(None)):
-    return await category_animes(provider or DEFAULT_PROVIDER, name, page)
-
-@app.get("/api/type/{name}")
-async def shorthand_type(name: str, page: int = 1, provider: Optional[str] = Query(None)):
-    return await type_animes(provider or DEFAULT_PROVIDER, name, page)
-
-@app.get("/api/azlist/{sort_option}")
-async def shorthand_azlist(sort_option: str, page: int = 1, provider: Optional[str] = Query(None)):
-    return await azlist(provider or DEFAULT_PROVIDER, sort_option, page)
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("API_PORT", 3000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+@app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
+async def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):
+    """The super simple sources endpoint resolving slugs (prefix-number) back to provider IDs."""
+    data = await _fetch_raw_episodes(anilist_id)
+    prov_data = data.get("providers", {}).get(provider, {})
+    ep_list = prov_data.get("episodes", {}).get(category, [])
+    
+    # Resolve the slug back to the original ID
+    target_id = None
+    for ep in ep_list:
+        orig_id = ep.get("id", "")
+        prefix = orig_id.split(":")[0] if ":" in orig_id else orig_id
+        generated = f"{prefix}-{ep.get('number')}"
+        if generated == slug:
+            target_id = orig_id
+            break
+            
+    if not target_id:
+        raise HTTPException(status_code=404, detail=f"Episode slug '{slug}' not found for provider {provider}")
+        
+    return await get_sources(episodeId=target_id, provider=provider, anilistId=anilist_id, category=category)
